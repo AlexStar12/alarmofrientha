@@ -1,156 +1,154 @@
 blueprint:
-  name: Alarmo Keypad Sync + Native PIN (Fix Feedback)
-  description: "Valide les codes via Alarmo + synchronisation complète du clavier (son + LED)"
+  name: Synchronisation Clavier - Alarme par Howmation (Corrigée)
+  description: >
+    Cette blueprint permet de relier un clavier Zigbee2MQTT à un panneau de contrôle d'alarme.
+    L'état du panneau d'alarme est synchronisé avec le clavier, et inversement.
   domain: automation
-
   input:
-    state_topic:
-      name: MQTT State Topic of your Keypad
+    mqtt_topic_etat_clavier:
+      name: Topic MQTT d'état du clavier Zigbee2MQTT
+      description: "Exemple : zigbee2mqtt/Clavier"
       selector:
         text:
-    set_topic:
-      name: MQTT Set Topic of your Keypad
+    mqtt_topic_commande_clavier:
+      name: Topic MQTT de commande du clavier Zigbee2MQTT
+      description: "Exemple : zigbee2mqtt/Clavier/set"
       selector:
         text:
-    entity:
-      name: Alarmo panel
+    code_pins:
+      name: Codes PIN valides
+      description: "Liste des codes PIN autorisés"
+      default:
+        - "1234"
+      selector:
+        text:
+          multiple: true
+    panneau_alarme:
+      name: Panneau de contrôle d'alarme
       selector:
         entity:
           domain: alarm_control_panel
-          integration: alarmo
-
-trigger:
-  - platform: mqtt
-    topic: !input state_topic
-    id: keypad_command
-
-  - platform: event
-    event_type: alarmo_command_success
-    id: arm_success
-
-  - platform: event
-    event_type: alarmo_failed_to_arm
-    id: arm_failed
-
-  - platform: state
-    entity_id: !input entity
-    id: alarm_state_change
 
 variables:
-  entity_id: !input entity
+  codes_pins_valides: !input code_pins
+
+trigger:
+  - platform: state
+    entity_id: !input panneau_alarme
+    id: changement_etat_alarme
+
+  - platform: mqtt
+    topic: !input mqtt_topic_etat_clavier
+    id: commande_clavier
 
 action:
   - choose:
-
-      # 1. COMMANDES VIA CLAVIER (code tapé)
       - conditions:
           - condition: trigger
-            id: keypad_command
+            id: changement_etat_alarme
         sequence:
-          - variables:
-              code: "{{ trigger.payload_json.action_code | default('') }}"
-              action: "{{ trigger.payload_json.action | default('') }}"
-              tx: "{{ trigger.payload_json.action_transaction | default('null') }}"
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: "{{ action == 'disarm' }}"
-                sequence:
-                  - service: alarmo.disarm
-                    data:
-                      entity_id: !input entity
-                      code: "{{ code }}"
-                      context_id: "{{ tx }}"
-              - conditions:
-                  - condition: template
-                    value_template: "{{ action == 'arm_all_zones' }}"
-                sequence:
-                  - service: alarmo.arm
-                    data:
-                      entity_id: !input entity
-                      mode: away
-                      code: "{{ code }}"
-                      context_id: "{{ tx }}"
-              - conditions:
-                  - condition: template
-                    value_template: "{{ action == 'arm_day_zones' }}"
-                sequence:
-                  - service: alarmo.arm
-                    data:
-                      entity_id: !input entity
-                      mode: home
-                      code: "{{ code }}"
-                      context_id: "{{ tx }}"
-
-      # 2. ALARME VALIDÉE PAR ALARMO → Feedback vers clavier
-      - conditions:
-          - condition: trigger
-            id: arm_success
-        sequence:
-          - variables:
-              tx: "{{ trigger.event.data.context_id }}"
-              mode: "{{ trigger.event.data.mode }}"
-              action: "{{ trigger.event.data.action }}"
           - service: mqtt.publish
             data:
-              topic: !input set_topic
+              topic: !input mqtt_topic_commande_clavier
               payload: >
-                {
-                  "arm_mode": {
-                    "transaction": "{{ tx }}",
-                    "mode": "{% if action == 'arm' and mode == 'away' %}arm_all_zones
-                             {% elif action == 'arm' and mode == 'home' %}arm_day_zones
-                             {% elif action == 'disarm' %}disarm
-                             {% else %}disarm{% endif %}"
-                  }
-                }
+                {% set etat = trigger.to_state.state %}
+                {% if etat == 'armed_away' %}
+                {"arm_mode":{"mode":"arm_all_zones"}}
+                {% elif etat == 'armed_home' %}
+                {"arm_mode":{"mode":"arm_day_zones"}}
+                {% elif etat == 'armed_night' %}
+                {"arm_mode":{"mode":"arm_night_zones"}}
+                {% elif etat == 'disarmed' %}
+                {"arm_mode":{"mode":"disarm"}}
+                {% elif etat == 'pending' %}
+                {"arm_mode":{"mode":"entry_delay"}}
+                {% elif etat == 'arming' %}
+                  {% if trigger.to_state.attributes.next_state == 'armed_home' %}
+                  {"arm_mode":{"mode":"arm_day_zones"}}
+                  {% elif trigger.to_state.attributes.next_state == 'armed_away' %}
+                  {"arm_mode":{"mode":"exit_delay"}}
+                  {% endif %}
+                {% endif %}
 
-      # 3. CODE FAUX OU AUTRE ERREUR → Feedback
       - conditions:
           - condition: trigger
-            id: arm_failed
+            id: commande_clavier
         sequence:
-          - variables:
-              tx: "{{ trigger.event.data.context_id }}"
-              reason: "{{ trigger.event.data.reason }}"
-              cmd: "{{ trigger.event.data.command }}"
           - choose:
               - conditions:
                   - condition: template
-                    value_template: "{{ reason == 'invalid_code' }}"
+                    value_template: >
+                      {{ trigger.payload_json.action_transaction is defined and
+                         trigger.payload_json.action_code in codes_pins_valides }}
                 sequence:
                   - service: mqtt.publish
                     data:
-                      topic: !input set_topic
+                      topic: !input mqtt_topic_commande_clavier
                       payload: >
                         {
                           "arm_mode": {
-                            "transaction": "{{ tx }}",
-                            "mode": "invalid_code"
+                            "transaction": "{{ trigger.payload_json.action_transaction }}",
+                            "mode": "{{ trigger.payload_json.action | trim }}"
                           }
                         }
 
-      # 4. SYNC AUTOMATIQUE SUR ÉTAT DE L’ALARME
-      - conditions:
-          - condition: trigger
-            id: alarm_state_change
-        sequence:
-          - variables:
-              s: "{{ trigger.to_state.state }}"
-          - service: mqtt.publish
-            data:
-              topic: !input set_topic
-              payload: >
-                {
-                  "arm_mode": {
-                    "mode": "{% if s == 'armed_away' %}arm_all_zones
-                             {% elif s == 'armed_home' %}arm_day_zones
-                             {% elif s == 'arming' %}exit_delay
-                             {% elif s == 'pending' %}entry_delay
-                             {% elif s == 'triggered' %}in_alarm
-                             {% else %}disarm{% endif %}"
-                  }
-                }
+                  - choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ trigger.payload_json.action == 'arm_all_zones' }}"
+                        sequence:
+                          - service: alarm_control_panel.alarm_arm_away
+                            target:
+                              entity_id: !input panneau_alarme
+                            data:
+                              code: "{{ trigger.payload_json.action_code }}"
+
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ trigger.payload_json.action == 'arm_day_zones' }}"
+                        sequence:
+                          - service: alarm_control_panel.alarm_arm_home
+                            target:
+                              entity_id: !input panneau_alarme
+                            data:
+                              code: "{{ trigger.payload_json.action_code }}"
+
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ trigger.payload_json.action == 'arm_night_zones' }}"
+                        sequence:
+                          - service: alarm_control_panel.alarm_arm_night
+                            target:
+                              entity_id: !input panneau_alarme
+                            data:
+                              code: "{{ trigger.payload_json.action_code }}"
+
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ trigger.payload_json.action == 'disarm' }}"
+                        sequence:
+                          - service: alarm_control_panel.alarm_disarm
+                            target:
+                              entity_id: !input panneau_alarme
+                            data:
+                              code: "{{ trigger.payload_json.action_code }}"
+
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ trigger.payload_json.action_transaction is defined and
+                         trigger.payload_json.action_code not in codes_pins_valides }}
+                sequence:
+                  - service: mqtt.publish
+                    data:
+                      topic: !input mqtt_topic_commande_clavier
+                      payload: >
+                        {
+                          "arm_mode": {
+                            "transaction": "{{ trigger.payload_json.action_transaction }}",
+                            "mode": "invalid_code"
+                          }
+                        }
 
 mode: parallel
 max: 10
