@@ -122,7 +122,7 @@ action:
                   - service: mqtt.publish
                     data:
                       topic: !input set_topic
-                      payload: >
+                      payload: |-
                         {
                           "arm_mode": {
                             "transaction": "{{ tx }}",
