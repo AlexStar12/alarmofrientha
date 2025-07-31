@@ -1,120 +1,107 @@
 blueprint:
-  name: Clavier Zigbee ↔️ Alarmo (validation par Alarmo)
-  description: >
-    Synchronise l'état d'un clavier Zigbee2MQTT avec un panneau de contrôle Alarmo,
-    sans valider les codes PIN côté blueprint (c'est Alarmo qui les valide).
+  name: Clavier Zigbee2MQTT + Alarmo (LED & bips + codes Alarmo)
+  description: Gère le clavier Zigbee avec Alarmo (retour sonore, LED, et vérif code via Alarmo uniquement).
   domain: automation
   input:
     mqtt_topic_etat_clavier:
-      name: Topic MQTT d'état du clavier Zigbee2MQTT
-      description: "Exemple : zigbee2mqtt/Clavier"
-      selector:
-        text:
+      name: Topic MQTT État clavier (Z2M)
     mqtt_topic_commande_clavier:
-      name: Topic MQTT de commande du clavier Zigbee2MQTT
-      description: "Exemple : zigbee2mqtt/Clavier/set"
-      selector:
-        text:
+      name: Topic MQTT Commande clavier (Z2M)
     panneau_alarme:
-      name: Panneau de contrôle Alarmo
+      name: Entité Alarmo
       selector:
         entity:
           domain: alarm_control_panel
 
 trigger:
-  - platform: state
-    entity_id: !input panneau_alarme
-    id: changement_etat_alarme
-
   - platform: mqtt
     topic: !input mqtt_topic_etat_clavier
     id: commande_clavier
 
+  - platform: state
+    entity_id: !input panneau_alarme
+    id: changement_etat_alarm
+
 action:
   - choose:
-      - conditions:
-          - condition: trigger
-            id: changement_etat_alarme
-        sequence:
-          - service: mqtt.publish
-            data:
-              topic: !input mqtt_topic_commande_clavier
-              payload: >
-                {% set etat = trigger.to_state.state %}
-                {% if etat == 'armed_away' %}
-                  {"arm_mode":{"mode":"arm_all_zones"}}
-                {% elif etat == 'armed_home' %}
-                  {"arm_mode":{"mode":"arm_day_zones"}}
-                {% elif etat == 'armed_night' %}
-                  {"arm_mode":{"mode":"arm_night_zones"}}
-                {% elif etat == 'disarmed' %}
-                  {"arm_mode":{"mode":"disarm"}}
-                {% elif etat == 'arming' %}
-                  {% if trigger.to_state.attributes.next_state == 'armed_home' %}
-                    {"arm_mode":{"mode":"arm_day_zones"}}
-                  {% elif trigger.to_state.attributes.next_state == 'armed_away' %}
-                    {"arm_mode":{"mode":"exit_delay"}}
-                  {% endif %}
-                {% endif %}
 
+      # 👉 Quand on tape un code sur le clavier
       - conditions:
           - condition: trigger
             id: commande_clavier
         sequence:
+          - variables:
+              action: "{{ trigger.payload_json.action }}"
+              code: "{{ trigger.payload_json.action_code }}"
+              tx: "{{ trigger.payload_json.action_transaction | default('null') }}"
           - choose:
               - conditions:
                   - condition: template
-                    value_template: >
-                      {{ trigger.payload_json.action_transaction is defined and trigger.payload_json.action_code is defined }}
+                    value_template: "{{ action == 'arm_all_zones' }}"
                 sequence:
-                  - service: mqtt.publish
+                  - service: alarm_control_panel.alarm_arm_away
+                    target:
+                      entity_id: !input panneau_alarme
                     data:
-                      topic: !input mqtt_topic_commande_clavier
-                      payload: >
-                        {
-                          "arm_mode": {
-                            "transaction": "{{ trigger.payload_json.action_transaction }}",
-                            "mode": "{{ trigger.payload_json.action | trim }}"
-                          }
-                        }
+                      code: "{{ code }}"
+                  - delay: 1
+              - conditions:
+                  - condition: template
+                    value_template: "{{ action == 'arm_day_zones' }}"
+                sequence:
+                  - service: alarm_control_panel.alarm_arm_home
+                    target:
+                      entity_id: !input panneau_alarme
+                    data:
+                      code: "{{ code }}"
+                  - delay: 1
+              - conditions:
+                  - condition: template
+                    value_template: "{{ action == 'disarm' }}"
+                sequence:
+                  - service: alarm_control_panel.alarm_disarm
+                    target:
+                      entity_id: !input panneau_alarme
+                    data:
+                      code: "{{ code }}"
+                  - delay: 1
+          # 📤 Feedback visuel/sonore : code incorrect → rouge + bip
+          - condition: template
+            value_template: "{{ not is_state_attr(panneau_alarme, 'code_format', none) and not is_state(panneau_alarme, 'arming') and not is_state(panneau_alarme, 'armed_away') }}"
+          - service: mqtt.publish
+            data:
+              topic: !input mqtt_topic_commande_clavier
+              payload: >
+                {
+                  "arm_mode": {
+                    "transaction": "{{ tx }}",
+                    "mode": "invalid_code"
+                  }
+                }
 
-                  - choose:
-                      - conditions:
-                          - condition: template
-                            value_template: "{{ trigger.payload_json.action == 'arm_all_zones' }}"
-                        sequence:
-                          - service: alarm_control_panel.alarm_arm_away
-                            target:
-                              entity_id: !input panneau_alarme
-                            data:
-                              code: "{{ trigger.payload_json.action_code }}"
+      # 🔁 Retour d'état depuis Alarmo vers clavier
+      - conditions:
+          - condition: trigger
+            id: changement_etat_alarm
+        sequence:
+          - variables:
+              etat: "{{ trigger.to_state.state }}"
+          - service: mqtt.publish
+            data:
+              topic: !input mqtt_topic_commande_clavier
+              payload: >
+                {
+                  "arm_mode": {
+                    "mode":
+                    {% if etat == 'armed_away' %}"arm_all_zones"
+                    {% elif etat == 'armed_home' %}"arm_day_zones"
+                    {% elif etat == 'arming' %}"exit_delay"
+                    {% elif etat == 'pending' %}"entry_delay"
+                    {% elif etat == 'triggered' %}"in_alarm"
+                    {% elif etat == 'disarmed' %}"disarm"
+                    {% else %}"disarm"
+                    {% endif %}
+                  }
+                }
 
-                      - conditions:
-                          - condition: template
-                            value_template: "{{ trigger.payload_json.action == 'arm_day_zones' }}"
-                        sequence:
-                          - service: alarm_control_panel.alarm_arm_home
-                            target:
-                              entity_id: !input panneau_alarme
-                            data:
-                              code: "{{ trigger.payload_json.action_code }}"
-
-                      - conditions:
-                          - condition: template
-                            value_template: "{{ trigger.payload_json.action == 'arm_night_zones' }}"
-                        sequence:
-                          - service: alarm_control_panel.alarm_arm_night
-                            target:
-                              entity_id: !input panneau_alarme
-                            data:
-                              code: "{{ trigger.payload_json.action_code }}"
-
-                      - conditions:
-                          - condition: template
-                            value_template: "{{ trigger.payload_json.action == 'disarm' }}"
-                        sequence:
-                          - service: alarm_control_panel.alarm_disarm
-                            target:
-                              entity_id: !input panneau_alarme
-                            data:
-                              code: "{{ trigger.payload_json.action_code }}"
+mode: restart
